@@ -1,0 +1,1272 @@
+
+# coding: utf-8
+
+# # Online Stage Transient
+
+# ## Imports
+
+# In[1]:
+
+
+# Imports
+import numpy as np
+import scipy.linalg as la
+# for reading the libMesh binary data files
+import xdrlib
+from time import time
+
+
+# ## Functions
+
+# In[2]:
+
+
+def read_offline_data(path_offline_data, q_a, q_f, q_l, n_outputs):
+    """This method is responsible for reading all offline data that are necessary for
+       calculating the output of interest without the output error bounds.
+       
+       Args:
+            path_offline_data = path to the offline data folder
+            q_a = number of stiffness matrices (A)
+            q_f = number of load vectors (f)
+            q_l = number of attached theta objects to each output vector
+            n_outputs = number of output vectors (l)
+           
+        Returns:
+            n_bfs = number of basis functions
+            RB_Aq = reduced stiffness matrices
+            RB_Fq = reduced load vectors
+            RB_Oq = reduced load vectors
+           
+        """
+    # number of basis functions
+    f = open(path_offline_data + '/n_bfs.xdr', 'rb').read()
+    n_bfs = xdrlib.Unpacker(f).unpack_int()
+
+    # RB_Aq
+    RB_Aq = np.ndarray([n_bfs, n_bfs, q_a])
+    for i in range(q_a):
+        f = open(path_offline_data + '/RB_A_00' + str(i) + '.xdr', 'rb').read()
+        u = xdrlib.Unpacker(f)
+        RB_Aq[:,:,i] = np.reshape(u.unpack_farray(n_bfs*n_bfs,u.unpack_double), [n_bfs,n_bfs])
+    
+    # RB_Fq
+    RB_Fq = np.ndarray([n_bfs, q_f])
+    for i in range(q_f):
+        f = open(path_offline_data + '/RB_F_00' + str(i) + '.xdr', 'rb').read()
+        u = xdrlib.Unpacker(f)
+        RB_Fq[:,i] = u.unpack_farray(n_bfs,u.unpack_double)
+        
+    # RB_Oq
+    RB_Oq = np.ndarray([n_bfs, n_outputs, q_l])
+    for i in range(n_outputs):
+        for j in range(q_l):
+            if(i<10):
+                f = open(path_offline_data + '/output_00' + str(i) + '_00' + str(j)
+                     + '.xdr', 'rb').read()
+            if(i>=10):
+                f = open(path_offline_data + '/output_0' + str(i) + '_00' + str(j)
+                     + '.xdr', 'rb').read()
+            u = xdrlib.Unpacker(f)
+            RB_Oq[:,i,j] = u.unpack_farray(n_bfs,u.unpack_double)
+
+    
+    return (n_bfs, RB_Aq, RB_Fq, RB_Oq)
+
+
+# In[3]:
+
+
+def read_error_offline_data(path_offline_data, q_a, q_f, q_l, n_outputs, online_N):
+    """This method is responsible for reading all offline data that are additionally necessary 
+       for calculating the output error bounds.
+       
+       Args:
+            path_offline_data = path to the offline data folder
+            q_a = number of stiffness matrices (A)
+            q_f = number of load vectors (f)
+            q_l = number of attached theta objects to each output vector
+            n_outputs = number of output vectors (l)
+            online_N = the number of basis functions that should be considered
+           
+        Returns:
+            Fq_representor_innerprods = the innerproducts from Fq-Fq
+            Fq_Aq_representor_innerprods = the innerproducts from Fq-Aq
+            Aq_Aq_representor_innerprods = the innerproducts from Aq-Aq
+            output_dual_innerprods = the innerproducts from output-output
+           
+        """
+    
+    f = open(path_offline_data + '/Fq_innerprods.xdr', 'rb').read()
+    u = xdrlib.Unpacker(f)
+    Fq_representor_innerprods = np.zeros([int(q_f*(q_f+1)/2),1])
+    Fq_representor_innerprods = np.reshape(u.unpack_farray(int(q_f*(q_f+1)/2),u.unpack_double),
+                                           [int(q_f*(q_f+1)/2),1])
+            
+    Fq_Aq_representor_innerprods = np.zeros([q_f,q_a,online_N])
+    f = open(path_offline_data + '/Fq_Aq_innerprods.xdr', 'rb').read()
+    u = xdrlib.Unpacker(f)
+    Fq_Aq_representor_innerprods = np.reshape(
+                        u.unpack_farray(q_f*q_a*online_N,u.unpack_double), [q_f,q_a,online_N])
+            
+    Aq_Aq_representor_innerprods = np.zeros([int(q_a*(q_a+1)/2),online_N, online_N])
+    f = open(path_offline_data + '/Aq_Aq_innerprods.xdr', 'rb').read()
+    u = xdrlib.Unpacker(f)
+    Aq_Aq_representor_innerprods = np.reshape(
+                        u.unpack_farray(int(q_a*(q_a+1)/2)*online_N*online_N,u.unpack_double), 
+                            [int(q_a*(q_a+1)/2),online_N, online_N])
+        
+    output_dual_innerprods = np.zeros([n_outputs, int(q_l*(q_l+1)/2)])
+    for i in range(n_outputs):
+        if(i<10):
+            f = open(path_offline_data + '/output_00' + str(i) +
+                    '_dual_innerprods.xdr', 'rb').read()
+        if(i>=10):
+            f = open(path_offline_data + '/output_0' + str(i) +
+                    '_dual_innerprods.xdr', 'rb').read()
+        u = xdrlib.Unpacker(f)
+        output_dual_innerprods[i,:] = u.unpack_farray(int(q_l*(q_l+1)/2),u.unpack_double)
+    
+    return (Fq_representor_innerprods, Fq_Aq_representor_innerprods, 
+            Aq_Aq_representor_innerprods, output_dual_innerprods)
+
+
+# In[4]:
+
+
+def read_transient_offline_data(path_transient_offline_data, q_m, n_bfs,
+                                parameter_dependent_IC = False, q_ic = 0):
+    """This method is responsible for reading all offline data that are
+       additionally necessary for the transient output of interest without the
+       output error bounds.
+
+       Args:
+            path_offline_data = path to the transient offline data folder
+            q_m = number of mass matrices (M)
+            n_bfs = number of basis functions
+            parameter_dependent_IC = determines whether the initial conditions
+                                     are parameter dependent or note
+            q_ic = number of intial conditions (IC)
+
+        Returns:
+            RB_Mq = reduced mass matrices
+            initial_conditions = initial conditions
+            RB_L2_matrix = reduced L2 matrix (only returned if
+                           parameter_dependent_IC = True)
+
+        """
+
+    # RB_Mq
+    RB_Mq = np.ndarray([n_bfs, n_bfs, q_m])
+    if(parameter_dependent_IC==True):
+        initial_conditions = np.ndarray([n_bfs, q_ic])
+        RB_L2_matrix = np.ndarray([n_bfs, n_bfs])
+
+    for i in range(q_m):
+        f = open(path_transient_offline_data + '/RB_M_00' + str(i) +
+                 '.xdr', 'rb').read()
+        u = xdrlib.Unpacker(f)
+        RB_Mq[:,:,i] = np.reshape(u.unpack_farray(n_bfs*n_bfs,u.unpack_double),
+                                  [n_bfs,n_bfs])
+
+    # intial conditions
+    # currently it is only supported if online_N = n_bfs
+    if(parameter_dependent_IC == False):
+        print("parameter_dependent_IC == False, so reading initial_conditions.xdr") ### new
+        initial_conditions = np.ndarray([n_bfs,1])
+        f = open(path_transient_offline_data + '/initial_conditions.xdr', 'rb').read()
+        u = xdrlib.Unpacker(f)
+        # position = 0
+        # for i in range(1,n_bfs):
+        #     position += (n_bfs-i)
+        # u.set_position(position)
+        initial_conditions = u.unpack_farray(n_bfs,u.unpack_double)
+
+        return (RB_Mq, initial_conditions)
+
+    else:
+        print("parameter_dependent_IC == True, so loading RB_IC_00x.xdr and RB_L2_matrix.xdr")
+        for i in range(q_ic):
+            f = open(path_transient_offline_data + '/RB_IC_00' + str(i) +
+                     '.xdr', 'rb').read()
+            u = xdrlib.Unpacker(f)
+            initial_conditions[:,i] = u.unpack_farray(n_bfs,u.unpack_double)
+
+        f = open(path_transient_offline_data + '/RB_L2_matrix.xdr', 'rb').read()
+        u = xdrlib.Unpacker(f)
+        RB_L2_matrix = np.reshape(u.unpack_farray(n_bfs*n_bfs, u.unpack_double),
+                                       [n_bfs,n_bfs])
+
+        return (RB_Mq, initial_conditions, RB_L2_matrix)
+
+
+# In[5]:
+
+
+def read_transient_error_offline_data(path_transient_offline_data, n_bfs, q_a,
+                                      q_m, q_f):
+    """This method is responsible for reading all offline data that are
+       additionally necessary for the transient output of interest with the
+       output error bounds.
+
+       Args:
+            path_offline_data = path to the transient offline data folder
+            n_bfs = number of basis functions
+            q_a = number of stiffness matrices (A)
+            q_m = number of mass matrices (M)
+            q_f = number of load vectors (f)
+
+        Returns:
+            initial_L2_error = initial L2 error
+            Fq_Mq_representor_innerprods = the innerproducts from Fq-Mq
+            Aq_Mq_representor_innerprods = the innerproducts from Aq-Mq
+            Mq_Mq_representor_innerprods = the innerproducts from Mq-Mq
+
+        """
+    # intial L2 error
+    # currently it is only supported if online_N = n_bfs
+    f = open(path_transient_offline_data + '/initial_L2_error.xdr', 'rb').read()
+    u = xdrlib.Unpacker(f)
+    initial_L2_error = u.unpack_farray(n_bfs,u.unpack_double)
+    initial_L2_error = initial_L2_error[-1]
+
+    Fq_Mq_representor_innerprods = np.zeros([q_f,q_m,n_bfs])
+    f = open(path_transient_offline_data + '/Fq_Mq_terms.xdr', 'rb').read()
+    u = xdrlib.Unpacker(f)
+    Fq_Mq_representor_innerprods = np.reshape(
+                        u.unpack_farray(q_f*q_m*n_bfs,u.unpack_double),
+                                        [q_f,q_m,n_bfs])
+
+    Aq_Mq_representor_innerprods = np.zeros([q_a, q_m, n_bfs, n_bfs])
+    f = open(path_transient_offline_data + '/Aq_Mq_terms.xdr', 'rb').read()
+    u = xdrlib.Unpacker(f)
+    Aq_Mq_representor_innerprods = np.reshape(
+                                u.unpack_farray(q_a*q_m*n_bfs*n_bfs,
+                                                u.unpack_double),
+                                                [q_a, q_m ,n_bfs, n_bfs])
+
+    Mq_Mq_representor_innerprods = np.zeros([(q_m*(q_m+1)/2),n_bfs, n_bfs])
+    f = open(path_transient_offline_data + '/Mq_Mq_terms.xdr', 'rb').read()
+    u = xdrlib.Unpacker(f)
+    Mq_Mq_representor_innerprods = np.reshape(
+                        u.unpack_farray((q_m*(q_m+1)/2)*n_bfs*n_bfs,
+                                        u.unpack_double),
+                                        [(q_m*(q_m+1)/2),n_bfs, n_bfs])
+
+    return (initial_L2_error, Fq_Mq_representor_innerprods,
+            Aq_Mq_representor_innerprods, Mq_Mq_representor_innerprods)
+
+
+# In[6]:
+
+
+def compute_residual_dual_norm(Fq_inner, Fq_Aq_inner, Aq_Aq_inner, q_a, q_f, 
+                               online_mu_parameters, online_N, RB_solution):
+    """This method is responsible for computing the residual dual norm.
+       
+       Args:
+            Fq_inner = the innerproducts from Fq-Fq
+            Fq_Aq_inner = the innerproducts from Fq-Aq
+            Aq_Aq_inner = the innerproducts from Aq-Aq
+            q_a = number of stiffness matrices (A)
+            q_f = number of load vectors (f)
+            online_mu_parameters = online parameters
+            online_N = the number of basis functions that should be considered
+            RB_solution = reduced solution vector
+           
+        Returns:
+            residual_norm_sq = the square root of the residual dual norm
+           
+        """
+    # residual_norm_sq = 0.
+    # q=0
+    # for q_f1 in range(q_f):
+    #     for q_f2 in range(q_f1, q_f):
+    #         if(q_f1==q_f2):
+    #             delta = 1.
+    #         else:
+    #             delta = 2.
+            
+    #         residual_norm_sq += delta*np.real(theta_F(online_mu_parameters)[q_f1]*
+    #                                           np.conj(theta_F(online_mu_parameters)[q_f2])*
+    #                                                   Fq_inner[q])
+    #         q +=1
+    residual_norm_sq = 0.
+    q = 0
+    Fq_inner_matrix = np.zeros((10,10))
+    for i in range(10):
+        for j in range(i,10):
+            Fq_inner_matrix[i][j] = Fq_inner_matrix[j][i] = Fq_inner[q]
+            q += 1
+    theta_F_crossproduct = np.zeros((10,10))
+    for i in range(10):
+        for j in range(10):
+            theta_F_crossproduct[i][j] = theta_F(online_mu_parameters)[i]*np.conj(theta_F(online_mu_parameters)[j])
+    residual_norm_sq += np.real(np.sum(np.sum(np.multiply(Fq_inner_matrix,theta_F_crossproduct),axis = 1),axis = 0 ))
+    
+#     residual_norm_sq = 0.
+#     q=0
+#     delta = [1,2,2,2,2,2,2,2,1,2,2,2,2,2,2,1,2,2,2,2,2,1,2,2,2,2,1,2,2,2,1,2,2,1,2,1]
+#     for q_f1 in range(q_f):            
+#         residual_norm_sq += sum(theta_F(online_mu_parameters)[q_f1]*
+#                             np.dot(np.multiply(delta[q_f1:q_f],
+#                                    theta_F(online_mu_parameters)[q_f1:q_f]),
+#                                    Fq_inner[q:q+(q_f-q_f1)]))
+#         q+=q_f-q_f1
+    
+    # for q_f1 in range(q_f):
+    #     for q_a1 in range(q_a):
+    #          residual_norm_sq += 2.*np.real(theta_F(online_mu_parameters)[q_f1]*
+    #                                 np.conj(theta_A(online_mu_parameters)[q_a1])*
+    #                                 np.dot(np.transpose(RB_solution),Fq_Aq_inner[q_f1][q_a1]))
+    theta_FA = np.array(theta_F(online_mu_parameters)).reshape(-1,1)*np.conj(theta_A(online_mu_parameters))
+    muplt_theta_FA_Fq_Aq_inner =  np.dot(Fq_Aq_inner,np.transpose(RB_solution))
+    residual_norm_sq += 2.*np.real(np.sum(np.sum(np.multiply(theta_FA,muplt_theta_FA_Fq_Aq_inner),axis = 1),axis = 0 ))
+    
+    rbsolution = RB_solution * np.transpose(RB_solution)
+    theta_A_crossproduct = np.zeros((9,9))
+    for i in range(9):
+        for j in range(9):
+            theta_A_crossproduct[i][j] = np.conj(theta_A(online_mu_parameters))[i]*theta_A(online_mu_parameters)[j]
+    transpose_Aq_Aq_inner  = np.zeros((9,9))  
+    q = 0    
+    for i in range(9):
+        for j in range(i,9):
+            transpose_Aq_Aq_inner[i][j] = transpose_Aq_Aq_inner[j][i] = np.sum(rbsolution*
+                                               np.transpose(Aq_Aq_inner[q]))
+            q += 1
+    residual_norm_sq += np.real(np.sum(np.sum(np.multiply(theta_A_crossproduct,transpose_Aq_Aq_inner),axis = 1),axis = 0 ))
+    
+    # rbsolution = RB_solution * np.transpose(RB_solution)
+    # theta_A_crossproduct = np.zeros((9,9))
+    # for i in range(9):
+    #     for j in range(9):
+    #         theta_A_crossproduct[i][j] = np.conj(theta_A(online_mu_parameters))[i]*theta_A(online_mu_parameters)[j]
+    
+    
+    if(np.real(residual_norm_sq)<0.):
+        residual_norm_sq = abs(residual_norm_sq)
+        
+    return np.sqrt(residual_norm_sq)
+    
+
+# In[7]:
+
+
+def eval_output_dual_norm(output_id, q_l, online_mu_parameters, output_innerprods):
+    """This method is responsible for evaluating the output dual norm.
+       
+       Args:
+            output_id = the output for which the dual norm should be calcualted
+            q_l = number of attached theta objects for each output vector
+            online_mu_parameters = online parameters
+            output_innerprods = the innerproducts from output-output
+           
+        Returns:
+            output_bound_sq = the square root of the output dual norm
+           
+        """
+    #(the old code)
+    # output_bound_sq = 0.
+    # q = 0
+    # for q_l1 in range(q_l):
+    #     for q_l2 in range(q_l1, q_l):
+    #         if(q_l1==q_l2):
+    #             delta = 1.
+    #         else:
+    #             delta = 2.
+            
+    #         output_bound_sq += delta*np.real(np.conj(theta_O(online_mu_parameters)[output_id])
+    #                                          * theta_O(online_mu_parameters)[output_id] *
+    #                                          output_innerprods[output_id][q])
+            
+    #         q +=1
+            
+    # return np.sqrt(output_bound_sq)
+
+    ### Test the timecost of calling theta_O: 2.6702880859375e-05s
+    # st_time = time.time()
+    theta_O_res = theta_O(online_mu_parameters) # new 
+    # print("Calling theta_O once used {}s\n".format(time.time()-st_time))
+
+    output_col_id = output_innerprods[output_id] # new
+    output_bound_sq = 0.
+    q = 0
+    "q_l is 1 now"
+    # print("q_l in function eval_output_dual_norm is {}".format(q_l))
+    for q_l1 in range(q_l):
+        for q_l2 in range(q_l1, q_l):
+            if(q_l1==q_l2):
+                delta = 1.
+            else:
+                delta = 2.
+
+            output_bound_sq += delta*np.real(np.conj(theta_O_res[output_id]) *\
+                            theta_O_res[output_id] * output_col_id[q])
+
+            q +=1
+
+    return np.sqrt(output_bound_sq)
+
+#Define two new functions,Mark1
+# @jit(nopython=True)
+def eval_output_dual_norm_new(delta_vec, theta_O_vec, output_innerprods):
+    # print("output_innerprods shape: {}".format(output_innerprods.shape))
+    # print("delta_vec shape: {}".format(delta_vec.shape))
+    # print("theta_O_vec shape: {}".format(theta_O_vec.shape))
+    # output_innerprods shape: (80, 1)
+    # delta_vec shape: (55,)
+    # theta_O_vec shape: (80, 1)
+
+    theta_O_conj = np.conj(theta_O_vec)
+    theta_O_conj_theta_O = np.conj(theta_O_vec) * theta_O_vec
+    # print("theta_O_conj_theta_O shape is {}".format(theta_O_conj_theta_O.shape))
+    # temp_1 = theta_O_conj_theta_O*output_innerprods
+    # print("theta_O_conj_theta_O*output_innerprods type: {}, shape: {}".format(type(temp_1), temp_1.shape))
+    # print("delta_vec type: {}, shape: {}".format(type(delta_vec), delta_vec.shape))
+    return np.sqrt(np.dot(theta_O_conj_theta_O*output_innerprods, delta_vec))[:,0]
+
+
+def eval_output_dual_norm_np(delta_vec, theta_O_conj_theta_O, output_innerprods):
+    # print("output_innerprods shape: {}".format(output_innerprods.shape))
+    # print("delta_vec shape: {}".format(delta_vec.shape))
+    # print("theta_O_vec shape: {}".format(theta_O_vec.shape))
+    # output_innerprods shape: (80, 1)
+    # delta_vec shape: (55,)
+    # theta_O_vec shape: (80, 1)
+
+
+    # print("theta_O_conj_theta_O shape is {}".format(theta_O_conj_theta_O.shape))
+    # temp_1 = theta_O_conj_theta_O*output_innerprods
+    # print("theta_O_conj_theta_O*output_innerprods type: {}, shape: {}".format(type(temp_1), temp_1.shape))
+    # print("delta_vec type: {}, shape: {}".format(type(delta_vec), delta_vec.shape))
+    return np.sqrt(np.dot(theta_O_conj_theta_O*output_innerprods, delta_vec))[:,0]
+
+
+# In[8]:
+
+
+def cache_online_residual_terms(online_N, q_a, q_m, q_f, Fq_inner, Fq_Aq_inner, Aq_Aq_inner,
+                                Fq_Mq_inner, Aq_Mq_inner, Mq_Mq_inner, online_mu_parameters):
+
+    """This method is responsible for caching the online residual terms.
+
+       Args:
+            online_N = the number of basis functions that should be considered
+            q_a = number of stiffness matrices (A)
+            q_m = number of mass matrices (M)
+            q_f = number of load vectors (f)
+            Fq_inner = the innerproducts from Fq-Fq
+            Fq_Aq_inner = the innerproducts from Fq-Aq
+            Aq_Aq_inner = the innerproducts from Aq-Aq
+            Fq_Mq_inner = the innerproducts from Fq-Mq
+            Aq_Mq_inner = the innerproducts from Aq-Mq
+            Mq_Mq_inner = the innerproducts from Mq-Mq
+            online_mu_parameters = online parameters
+
+        Returns:
+            cached_Fq_term = Fq contribution to residual dual norm
+            cached_Fq_Aq_vector = Fq-Aq contribution to residual dual norm
+            cached_Aq_Aq_matrix = Aq-Aq contribution to residual dual norm
+            cached_Fq_Mq_vector = Fq-Mq contribution to residual dual norm
+            cached_Aq_Mq_matrix = Aq-Mq contribution to residual dual norm
+            cached_Mq_Mq_matrix = Mq-Mq contribution to residual dual norm
+
+    """
+
+    cached_Fq_term = 0
+    #q_f = 1
+    #q_a = 3
+    #1.first for loop
+    cached_Fq_term += theta_F(online_mu_parameters)[0]*theta_F(online_mu_parameters)[0]*Fq_inner[0]
+    
+    cached_Fq_Aq_vector = np.zeros([online_N,1])
+    #online_N = 10
+    
+    #2.second for loop
+    thata_F_A_crossproduct =np.zeros((q_f,q_a))
+    for q_f1 in range(q_f):
+        for q_a1 in range(q_a):
+            thata_F_A_crossproduct[q_f1][q_a1] = theta_F(online_mu_parameters)[q_f1]*theta_A(online_mu_parameters)[q_a1]
+
+    for q_f1 in range(q_f):
+        for q_a1 in range(q_a):
+            for i in range(online_N):
+                delta = 2.
+                cached_Fq_Aq_vector[i] += delta* thata_F_A_crossproduct[q_f1][q_a1] * Fq_Aq_inner[q_f1][q_a1][i]
+    
+
+    #3.third for loop
+    cached_Aq_Aq_matrix = np.zeros([online_N, online_N])
+    theta_A_crossproduct = np.zeros((q_a,q_a))
+    for q_a1 in range(q_a):
+         for q_a2 in range(q_a1, q_a):
+            theta_A_crossproduct[q_a1][q_a2] = theta_A_crossproduct[q_a2][q_a1]= theta_A(online_mu_parameters)[q_a1]*theta_A(online_mu_parameters)[q_a2]
+    # q=0
+    # for q_a1 in range(q_a):
+    #     for q_a2 in range(q_a1, q_a):
+    #         if(q_a1==q_a2):
+    #             delta = 1.
+    #         else:
+    #             delta = 2.
+
+    #         for i in range(online_N):
+    #             for j in range(online_N):
+    #                 cached_Aq_Aq_matrix[i,j] += delta*theta_A_crossproduct[q_a1][q_a2]*Aq_Aq_inner[q][i][j]
+    #         q += 1
+    Aq_Aq_inner_matrix = np.zeros([q_a, q_a,online_N, online_N])
+    q = 0
+    for q_a1 in range(q_a):
+        for q_a2 in range(q_a1, q_a):
+            Aq_Aq_inner_matrix[q_a1,q_a2,:,:] = Aq_Aq_inner_matrix[q_a2,q_a1,:,:] = Aq_Aq_inner[q,:,:]
+            q +=1
+    #print "The shape of Aq_Aq_inner_matrix",Aq_Aq_inner_matrix[:,:,1,1].shape
+    for i in range(online_N):
+        for j in range(online_N):
+            cached_Aq_Aq_matrix[i][j] += np.sum(np.sum(np.multiply(theta_A_crossproduct,Aq_Aq_inner_matrix[:,:,i,j]),axis = 1),axis = 0 )
+    
+    #print "cached_Aq_Aq_matrix",cached_Aq_Aq_matrix
+    #print "The shape of cached_Aq_Aq_matrix",cached_Aq_Aq_matrix
+
+    cached_Fq_Mq_vector = np.zeros([online_N,1])
+    #q_f = q_m =1
+    for q_f1 in range(q_f):
+        for q_m1 in range(q_m):
+            for i in range(online_N):
+                delta = 2.
+
+                cached_Fq_Mq_vector[i] += delta*theta_F(online_mu_parameters)[q_f1]*theta_M(online_mu_parameters)[q_m1]*Fq_Mq_inner[q_f1][q_m1][i]
+    # theta_F_M_crossproduct = np.zeros((q_f,q_m))
+    # for q_f1 in range(q_f):
+    #     for q_m1 in range(q_m):
+    #         theta_F_M_crossproduct[q_f1][q_m1] = theta_F(online_mu_parameters)[q_f1]*theta_M(online_mu_parameters)[q_m1]
+    # for i in range(online_N):
+    #     cached_Fq_Mq_vector[i] += delta*np.sum(np.sum(np.multiply(theta_F_M_crossproduct,Fq_Mq_inner[:][:][i]),axis = 1),axis = 0 )
+    #print "Fq_Mq_inner",Fq_Mq_inner,Fq_Mq_inner.shape
+    cached_Aq_Mq_matrix = np.zeros([online_N, online_N])
+    for q_a1 in range(q_a):
+        for q_m1 in range(q_m):
+            delta = 2.
+
+            for i in range(online_N):
+                for j in range(online_N):
+                    cached_Aq_Mq_matrix[i,j] += delta*theta_A(online_mu_parameters)[q_a1]*theta_M(online_mu_parameters)[q_m1]*Aq_Mq_inner[q_a1][q_m1][i][j]
+
+    cached_Mq_Mq_matrix = np.zeros([online_N, online_N])
+    q=0
+    for q_m1 in range(q_m):
+        for q_m2 in range(q_m1, q_m):
+            if(q_m1==q_m2):
+                delta = 1.
+            else:
+                delta = 2.
+
+            for i in range(online_N):
+                for j in range(online_N):
+                    cached_Mq_Mq_matrix[i,j] += delta*theta_M(online_mu_parameters)[q_m1]*theta_M(online_mu_parameters)[q_m2]*Mq_Mq_inner[q][i][j]
+            q +=1
+
+    return(cached_Fq_term, cached_Fq_Aq_vector, cached_Aq_Aq_matrix, cached_Fq_Mq_vector,
+           cached_Aq_Mq_matrix, cached_Mq_Mq_matrix)
+
+
+# In[9]:
+
+
+def compute_transient_residual_dual_norm(dt, euler_theta, current_timestep, online_N,
+                                         RB_solution, old_RB_solution, cached_Fq_term,
+                                         cached_Fq_Aq_vector, cached_Aq_Aq_matrix,
+                                         cached_Fq_Mq_vector, cached_Aq_Mq_matrix,
+                                         cached_Mq_Mq_matrix):
+
+    """This method is responsible for computing the transient residual dual norm.
+
+       Args:
+           dt = time step size
+           euler_theta = Time stepping scheme
+           current_timestep = current time step
+           RB_solution = reduced solution vector
+           old_RB_solution = old reduced solution vector
+           cached_Fq_term = Fq contribution to residual dual norm
+           cached_Fq_Aq_vector = Fq-Aq contribution to residual dual norm
+           cached_Aq_Aq_matrix = Aq-Aq contribution to residual dual norm
+           cached_Fq_Mq_vector = Fq-Mq contribution to residual dual norm
+           cached_Aq_Mq_matrix = Aq-Mq contribution to residual dual norm
+           cached_Mq_Mq_matrix = Mq-Mq contribution to residual dual norm
+
+        Returns:
+           residual_norm_sq = the square root of the residual dual norm
+
+    """
+
+    current_control = get_control(current_timestep)
+
+    RB_u_euler_theta = np.ndarray([online_N,1])
+    mass_coeff = np.ndarray([online_N,1])
+
+    RB_u_euler_theta = np.reshape((euler_theta*RB_solution)+((1.-euler_theta)*old_RB_solution)
+                                  ,[online_N,1])
+    mass_coeff = -(RB_solution-np.reshape(old_RB_solution, [online_N,1]))/dt
+
+    residual_norm_sq = current_control*current_control*cached_Fq_term
+    residual_norm_sq += current_control*np.dot(RB_u_euler_theta[:,0], cached_Fq_Aq_vector[:,0])
+    residual_norm_sq += current_control*np.dot(mass_coeff[:,0], cached_Fq_Mq_vector[:,0])
+
+    residual_norm_sq += np.sum(np.dot(RB_u_euler_theta,np.transpose(RB_u_euler_theta))
+                               *cached_Aq_Aq_matrix)
+    residual_norm_sq += np.sum(np.dot(mass_coeff,np.transpose(mass_coeff))
+                               *cached_Mq_Mq_matrix)
+    residual_norm_sq += np.sum(np.dot(RB_u_euler_theta,np.transpose(mass_coeff))
+                               *cached_Aq_Mq_matrix)
+
+    if(np.real(residual_norm_sq) < 0):
+        residual_norm_sq = abs(residual_norm_sq)
+
+    return(np.sqrt(residual_norm_sq))
+
+
+# In[10]:
+
+
+def stability_lower_bound(online_mu_parameters):
+    return min(online_mu_parameters)
+
+
+# In[11]:
+
+#Mark2
+def theta_A (online_mu_parameters):
+    return online_mu_parameters[:3]
+    #return [online_mu_parameters[0], online_mu_parameters[1], online_mu_parameters[2]]
+
+
+# In[12]:
+
+
+def theta_F (online_mu_parameters):
+    return np.array([1])
+    #return [1]
+
+
+# In[13]:
+
+
+def theta_O (online_mu_parameters):
+    return np.ones(80)
+    # return [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
+    #         1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1]
+
+
+# In[14]:
+
+
+def theta_M (online_mu_parameters):
+    return np.array([1])
+    #return [1]
+
+
+# In[15]:
+
+
+def theta_IC (online_mu_parameters):
+    return online_mu_parameters[-1]
+
+
+# In[16]:
+
+
+def get_control(time_level):
+    return 1.0
+
+
+# In[17]:
+
+
+def rb_solve_without_error_bound(online_mu_parameters, q_a, q_f, q_l, n_outputs, online_N, 
+                                 RB_Aq, RB_Fq, RB_Oq):
+    """This method is responsible performing the rb solve without the output error bounds.
+       
+       Args:
+           online_mu_parameters = online parameters
+           q_a = number of stiffness matrices (A)
+           q_f = number of load vectors (f)
+           q_l = number of attached theta objects to each output vector
+           n_outputs = number of output vectors (l)
+           online_N = the number of basis functions that should be considered
+           RB_Aq = reduced stiffness matrices
+           RB_Fq = reduced load vectors
+           RB_Oq = reduced load vectors
+           
+        Returns:
+            RB_outputs = the output of interest
+           
+        """
+    
+    # solution vector
+    #RB_solution=np.array(online_N)
+    
+    # assemble the RB system
+    #RB_system_matrix=np.array([online_N, online_N])
+    RB_system_matrix = np.sum(RB_Aq*theta_A(online_mu_parameters), axis = 2)
+    
+    # assemble the RB rhs
+    #RB_rhs= np.zeros(online_N)
+    RB_rhs = np.sum(RB_Fq*theta_F(online_mu_parameters), axis = 1) 
+    
+    RB_solution = np.reshape(la.lu_solve(la.lu_factor(RB_system_matrix), RB_rhs),[online_N,1])
+    
+    # evaluate the RB outputs (NOTE works currently only for q_l=1)
+    #RB_outputs = np.zeros(n_outputs)
+    RB_outputs = np.sum(RB_solution*(RB_Oq[:,:,0]*theta_O(online_mu_parameters)), axis=0)
+
+    return  (RB_outputs)
+
+
+# In[18]:
+
+
+def rb_solve_with_error_bound(online_mu_parameters, q_a, q_f, q_l, n_outputs, online_N, 
+                              RB_Aq, RB_Fq, RB_Oq, Fq_inner, Fq_Aq_inner, Aq_Aq_inner, 
+                              output_inner):
+    """This method is responsible performing the rb solve with the output error bounds.
+       
+       Args:
+           online_mu_parameters = online parameters
+           q_a = number of stiffness matrices (A)
+           q_f = number of load vectors (f)
+           q_l = number of attached theta objects to each output vector
+           n_outputs = number of output vectors (l)
+           online_N = the number of basis functions that should be considered
+           RB_Aq = reduced stiffness matrices
+           RB_Fq = reduced load vectors
+           RB_Oq = reduced load vectors
+           Fq_inner = the innerproducts from Fq-Fq
+           Fq_Aq_inner = the innerproducts from Fq-Aq
+           Aq_Aq_inner = the innerproducts from Aq-Aq
+           output_inner = the innerproducts from output-output
+           
+        Returns:
+            RB_outputs = the output of interest
+            RB_output_error_bounds = the error bounds for the output of interest
+           
+        """
+    
+    # solution vector
+    RB_solution=np.zeros(online_N)
+    
+    # assemble the RB system
+    RB_system_matrix=np.array([online_N, online_N])
+    RB_system_matrix = np.sum(RB_Aq*theta_A(online_mu_parameters), axis = 2)
+    
+    # assemble the RB rhs
+    RB_rhs= np.zeros(online_N)
+    RB_rhs = np.sum(RB_Fq*theta_F(online_mu_parameters), axis = 1) 
+    
+    RB_solution = np.reshape(la.lu_solve(la.lu_factor(RB_system_matrix), RB_rhs),[online_N,1])
+    
+    # evaluate the RB outputs and corresponding errors
+    epsilon_N = compute_residual_dual_norm(Fq_inner, Fq_Aq_inner, Aq_Aq_inner, q_a, q_f, 
+                                               online_mu_parameters, online_N, RB_solution)
+    alpha_LB = stability_lower_bound(online_mu_parameters)
+        
+    if(alpha_LB>0.):
+        abs_error_bound = epsilon_N/alpha_LB
+    else:
+        print("The lower bound must be larger than 0.")
+        return
+        
+#     RB_outputs = np.zeros(n_outputs)
+    RB_output_error_bounds = np.zeros(n_outputs)
+    RB_outputs = np.sum(RB_solution*(RB_Oq[:,:,0]*theta_O(online_mu_parameters)), axis=0)
+    
+    for i in range(n_outputs):
+        RB_output_error_bounds[i]=abs_error_bound*eval_output_dual_norm(i, q_l, 
+                                                                         online_mu_parameters, 
+                                                                         output_inner)
+    
+    return (RB_outputs, RB_output_error_bounds)
+
+
+# In[19]:
+
+
+def transient_rb_solve_without_error_bound(online_mu_parameters, q_a, q_m, q_f,
+                                           q_l, n_outputs, online_N, n_timesteps,
+                                           dt, euler_theta, RB_Aq, RB_Mq, RB_Fq,
+                                           RB_Oq, initial_conditions,
+                                           parameter_dependent_IC = False, q_ic = 0,
+                                           RB_L2_matrix = 0):
+
+    """This method is responsible performing the transient rb solve without the
+       output error bounds.
+
+       Args:
+           online_mu_parameters = online parameters
+           q_a = number of stiffness matrices (A)
+           q_m = number of mass matrices (M)
+           q_f = number of load vectors (f)
+           q_l = number of attached theta objects to each output vector
+           n_outputs = number of output vectors (l)
+           online_N = the number of basis functions that should be considered
+           n_timesteps = number of time steps
+           dt = time step size
+           euler_theta = Time stepping scheme
+           RB_Aq = reduced stiffness matrices
+           RB_Mq = reduced mass matrices
+           RB_Fq = reduced load vectors
+           RB_Oq = reduced load vectors
+           initial_conditions = initial conditions
+           parameter_dependent_IC = determines whether the initial conditions
+                                    are parameter dependent or note
+           q_ic = number of intial conditions (IC)
+           RB_L2_matrix = reduced L2 matrix
+
+        Returns:
+            RB_outputs_all_k = the output of interest for all timesteps
+
+        """
+    #Mark3
+    theta_O_res = theta_O(online_mu_parameters)
+    theta_O_vec = np.array(theta_O_res).reshape(-1, 1)
+    RB_Oq_reshaped = RB_Oq.reshape(10,80).T
+
+    # assemble the mass matrix
+    RB_mass_matrix_N = np.zeros([online_N, online_N])
+    RB_mass_matrix_N = np.sum(RB_Mq*theta_M(online_mu_parameters), axis = 2)
+
+    # assemble LHS matrix
+    #RB_LHS_matrix = np.zeros([online_N, online_N])
+    RB_LHS_matrix = RB_mass_matrix_N * (1./dt)
+    RB_LHS_matrix += np.sum(RB_Aq*theta_A(online_mu_parameters), axis = 2)
+
+    # assemble RHS matrix
+    #RB_RHS_matrix = np.zeros([online_N, online_N])
+    RB_RHS_matrix = RB_mass_matrix_N * (1./dt)
+    RB_RHS_matrix += np.sum(-(1.-euler_theta)*RB_Aq*theta_A(online_mu_parameters), axis = 2)
+
+    # add forcing terms
+    RB_RHS_save = np.zeros([online_N])
+    RB_RHS_save += np.sum(RB_Fq*theta_F(online_mu_parameters), axis = 1)
+
+    # add the intial conditions to the solution vector
+    RB_solution = np.zeros([online_N,1])
+
+    if(parameter_dependent_IC==False):
+        RB_solution = initial_conditions
+    else:
+        RB_rhs_N= np.zeros([online_N,1]);
+        RB_rhs_N += initial_conditions*theta_IC(online_mu_parameters)
+        RB_solution = la.lu_solve(la.lu_factor(RB_L2_matrix), RB_rhs_N)
+        RB_solution = RB_solution[:,0]
+
+    old_RB_solution = np.zeros([online_N,1])
+    #Mark4
+    RB_solution_reshaped = np.reshape(RB_solution, [online_N,1])
+    # initialize the RB rhs
+    RB_rhs = np.zeros([online_N,1])
+
+    # initialize the vectors storing the solution data
+    RB_temporal_solution_data = np.zeros([n_timesteps+1,online_N])
+
+    # load the initial data
+    RB_temporal_solution_data[0] = RB_solution
+
+    # set outputs at initial time
+    # Mark5(change the colume and row)
+    RB_outputs_all_k = np.zeros([n_timesteps+1, n_outputs])
+    #RB_outputs_all_k = np.zeros([n_outputs, n_timesteps+1])
+
+    for i in range(n_outputs):
+        RB_outputs_all_k[0][i] = np.sum(RB_Oq[:,i,:]*theta_O(online_mu_parameters)[i]*
+                                        np.reshape(RB_solution, [online_N,1]))
+
+    for i in range(1,n_timesteps+1):
+        old_RB_solution = RB_solution
+
+        RB_rhs = np.dot(RB_RHS_matrix, old_RB_solution)
+
+        # add forcing term
+        RB_rhs += get_control(i)*RB_RHS_save
+
+        RB_solution = la.lu_solve(la.lu_factor(RB_LHS_matrix), RB_rhs)
+        #Mark 6
+        RB_solution_reshaped = np.reshape(RB_solution, [online_N,1])
+        
+        # Save RB_solution for current time level
+        RB_temporal_solution_data[i] = RB_solution;
+        #Mark 7(convert the loop to matrix production)
+        RB_outputs_all_k[i] = np.dot(RB_Oq_reshaped*theta_O_vec, RB_solution_reshaped).T
+        # for j in range(n_outputs):
+        #     RB_outputs_all_k[j][i] = np.sum(RB_Oq[:,j,:]*theta_O(online_mu_parameters)[j]*
+        #                                   np.reshape(RB_solution, [online_N,1]))
+
+
+    return (RB_outputs_all_k)
+
+
+# In[20]:
+
+
+def transient_rb_state_solve(online_mu_parameters, q_a, q_m, q_f,
+                             online_N, n_timesteps, dt, euler_theta,
+                             RB_Aq, RB_Mq, RB_Fq, initial_conditions,
+                             parameter_dependent_IC = False, q_ic = 0,
+                             RB_L2_matrix = 0):
+
+    """This method is responsible performing the transient rb solve without the
+       output error bounds.
+
+       Args:
+           online_mu_parameters = online parameters
+           q_a = number of stiffness matrices (A)
+           q_m = number of mass matrices (M)
+           q_f = number of load vectors (f)
+           online_N = the number of basis functions that should be considered
+           n_timesteps = number of time steps
+           dt = time step size
+           euler_theta = Time stepping scheme
+           RB_Aq = reduced stiffness matrices
+           RB_Mq = reduced mass matrices
+           RB_Fq = reduced load vectors
+           initial_conditions = initial conditions
+           parameter_dependent_IC = determines whether the initial conditions
+                                    are parameter dependent or note
+           q_ic = number of intial conditions (IC)
+           RB_L2_matrix = reduced L2 matrix
+
+        Returns:
+            RB_outputs_all_k = the output of interest for all timesteps
+
+        """
+
+    # assemble the mass matrix
+    RB_mass_matrix_N = np.zeros([online_N, online_N])
+    RB_mass_matrix_N = np.sum(RB_Mq*theta_M(online_mu_parameters), axis = 2)
+
+    # assemble LHS matrix
+    RB_LHS_matrix = np.zeros([online_N, online_N])
+    RB_LHS_matrix = RB_mass_matrix_N * (1./dt)
+    RB_LHS_matrix += np.sum(RB_Aq*theta_A(online_mu_parameters), axis = 2)
+
+    # assemble RHS matrix
+    RB_RHS_matrix = np.zeros([online_N, online_N])
+    RB_RHS_matrix = RB_mass_matrix_N * (1./dt)
+    RB_RHS_matrix += np.sum(-(1.-euler_theta)*RB_Aq*theta_A(online_mu_parameters), axis = 2)
+
+    # add forcing terms
+    RB_RHS_save = np.zeros([online_N])
+    RB_RHS_save += np.sum(RB_Fq*theta_F(online_mu_parameters), axis = 1)
+
+    # add the intial conditions to the solution vector
+    RB_solution = np.zeros([online_N,1])
+
+    if(parameter_dependent_IC==False):
+        RB_solution = initial_conditions
+    else:
+        RB_rhs_N= np.zeros([online_N,1]);
+        RB_rhs_N += initial_conditions*theta_IC(online_mu_parameters)
+        RB_solution = la.lu_solve(la.lu_factor(RB_L2_matrix), RB_rhs_N)
+        RB_solution = RB_solution[:,0]
+
+    old_RB_solution = np.zeros([online_N,1])
+
+    # initialize the RB rhs
+    RB_rhs = np.zeros([online_N,1])
+
+    # initialize the vectors storing the solution data
+    RB_temporal_solution_data = np.zeros([n_timesteps+1,online_N])
+
+    # load the initial data
+    RB_temporal_solution_data[0] = RB_solution
+
+    for i in range(1,n_timesteps+1):
+        old_RB_solution = RB_solution
+
+        RB_rhs = np.dot(RB_RHS_matrix, old_RB_solution)
+
+        # add forcing term
+        RB_rhs += get_control(i)*RB_RHS_save
+
+        RB_solution = la.lu_solve(la.lu_factor(RB_LHS_matrix), RB_rhs)
+
+        # Save RB_solution for current time level
+        RB_temporal_solution_data[i] = RB_solution;
+
+
+    return (RB_temporal_solution_data[-1])
+
+
+# In[21]:
+#delete the extra funciton
+
+
+# In[22]:
+def transient_rb_solve_with_error_bound(online_mu_parameters, q_a, q_m, q_f, q_l,
+                                        n_outputs, online_N, n_timesteps, dt, euler_theta,
+                                        RB_Aq, RB_Mq, RB_Fq, RB_Oq, Fq_inner, Fq_Aq_inner,
+                                        Aq_Aq_inner, output_inner, Fq_Mq_inner, Aq_Mq_inner,
+                                        Mq_Mq_inner, initial_conditions, initial_L2_error,
+                                        parameter_dependent_IC = False, q_ic = 0,
+                                        RB_L2_matrix = 0):
+
+    """This method is responsible performing the transient rb solve with the
+       output error bounds.
+
+       Args:
+           online_mu_parameters = online parameters
+           q_a = number of stiffness matrices (A)
+           q_m = number of mass matrices (M)
+           q_f = number of load vectors (f)
+           q_l = number of attached theta objects to each output vector
+           n_outputs = number of output vectors (l)
+           online_N = the number of basis functions that should be considered
+           n_timesteps = number of time steps
+           dt = time step size
+           euler_theta = Time stepping scheme
+           RB_Aq = reduced stiffness matrices
+           RB_Mq = reduced mass matrices
+           RB_Fq = reduced load vectors
+           RB_Oq = reduced load vectors
+           Fq_inner = the innerproducts from Fq-Fq
+           Fq_Aq_inner = the innerproducts from Fq-Aq
+           Aq_Aq_inner = the innerproducts from Aq-Aq
+           output_inner = the innerproducts from output-output
+           Fq_Mq_inner = the innerproducts from Fq-Mq
+           Aq_Mq_inner = the innerproducts from Aq-Mq
+           Mq_Mq_inner = the innerproducts from Mq-Mq
+           initial_conditions = initial conditions
+           initial_L2_error = initial L2 error
+
+        Returns:
+            RB_outputs_all_k = the output of interest for all timesteps
+            RB_output_error_bounds_all_k = the error bounds for the output of interest
+
+        """
+
+    # assemble the mass matrix
+    #RB_mass_matrix_N = np.zeros([online_N, online_N])
+    RB_mass_matrix_N = np.sum(RB_Mq*theta_M(online_mu_parameters), axis = 2)
+
+    # assemble LHS matrix
+    #RB_LHS_matrix = np.zeros([online_N, online_N])
+    RB_LHS_matrix = RB_mass_matrix_N * (1./dt)
+    RB_LHS_matrix += np.sum(RB_Aq*theta_A(online_mu_parameters), axis = 2)
+
+    # assemble RHS matrix
+    #RB_RHS_matrix = np.zeros([online_N, online_N])
+    RB_RHS_matrix = RB_mass_matrix_N * (1./dt)
+    RB_RHS_matrix += np.sum(-(1.-euler_theta)*RB_Aq*theta_A(online_mu_parameters), axis = 2)
+
+    # add forcing terms
+    RB_RHS_save = np.zeros([online_N])
+    RB_RHS_save += np.sum(RB_Fq*theta_F(online_mu_parameters), axis = 1)
+
+    # add the intial conditions to the solution vector
+    RB_solution = np.zeros([online_N,1])
+
+    if(parameter_dependent_IC==False):
+        RB_solution = initial_conditions
+    else:
+        RB_rhs_N= np.zeros([online_N,1]);
+        RB_rhs_N += initial_conditions*theta_IC(online_mu_parameters)
+        RB_solution = la.lu_solve(la.lu_factor(RB_L2_matrix), RB_rhs_N)
+        RB_solution = RB_solution[:,0]
+
+    old_RB_solution = np.zeros([online_N,1])
+
+    # initialize the RB rhs
+    RB_rhs = np.zeros([online_N,1])
+
+    # initialize the vectors storing the solution data
+    RB_temporal_solution_data = np.zeros([n_timesteps+1,online_N])
+
+    # load the initial data
+    RB_temporal_solution_data[0] = RB_solution
+
+    # set error bounds at initial time
+    error_bound_sum = 0.
+    alpha_LB = 0.
+    error_bound_all_k = np.zeros([n_timesteps+1,1])
+
+    error_bound_sum += initial_L2_error**2
+    error_bound_all_k[0] = np.sqrt(error_bound_sum)
+
+    #Mark 8
+    # # set outputs at initial time
+    # RB_outputs_all_k = np.zeros([n_outputs, n_timesteps+1])
+    # RB_output_error_bounds_all_k = np.zeros([n_outputs, n_timesteps+1])
+
+    # for i in range(n_outputs):
+    #     RB_outputs_all_k[i][0] = np.sum(RB_Oq[:,i,:]*theta_O(online_mu_parameters)[i]*
+    #                                     np.reshape(RB_solution, [online_N,1]))
+    #     RB_output_error_bounds_all_k[i][0] = error_bound_all_k[0] * eval_output_dual_norm(i,
+    #                                                                     q_l,
+    RB_outputs_all_k = np.zeros([n_timesteps+1, n_outputs]) # new
+    RB_output_error_bounds_all_k = np.zeros([n_timesteps+1, n_outputs]) # new
+
+    RB_solution_reshaped = np.reshape(RB_solution, [online_N,1])
+    theta_O_res = theta_O(online_mu_parameters)
+    theta_O_vec = np.array(theta_O_res).reshape(-1, 1)
+    theta_O_conj = np.conj(theta_O_vec)
+    theta_O_conj_theta_O = np.conj(theta_O_vec) * theta_O_vec
+    # print("theta_O_vec shape is {}\n".format(theta_O_vec.shape))    
+
+    ### Store initial output and error
+    for idx_col in range(n_outputs):
+        RB_outputs_all_k[0][idx_col] = np.sum(RB_Oq[:,idx_col,:]*theta_O_res[idx_col]*
+                                        RB_solution_reshaped)
+        RB_output_error_bounds_all_k[0][idx_col] = error_bound_all_k[0] * eval_output_dual_norm(idx_col,
+                                                                        q_l,
+                                                                        online_mu_parameters,
+                                                                        output_inner)
+
+    alpha_LB = stability_lower_bound(online_mu_parameters)
+
+    [cached_Fq_term, cached_Fq_Aq_vector, cached_Aq_Aq_matrix, cached_Fq_Mq_vector,     cached_Aq_Mq_matrix, cached_Mq_Mq_matrix] = cache_online_residual_terms(online_N,
+                                                                             q_a, q_m, q_f,
+                                                                             Fq_inner,
+                                                                             Fq_Aq_inner,
+                                                                             Aq_Aq_inner,
+                                                                             Fq_Mq_inner,
+                                                                             Aq_Mq_inner,
+                                                                             Mq_Mq_inner,
+                                                                    online_mu_parameters)
+
+    RB_Oq_reshaped = RB_Oq.reshape(10,80).T
+    for i in range(1,n_timesteps+1):
+        old_RB_solution = RB_solution
+
+        RB_rhs = np.dot(RB_RHS_matrix, old_RB_solution)
+
+        # add forcing term
+        RB_rhs += get_control(i)*RB_RHS_save
+
+        RB_solution = la.lu_solve(la.lu_factor(RB_LHS_matrix), RB_rhs)
+        #Mark 10
+        RB_solution_reshaped = np.reshape(RB_solution, [online_N,1])
+        # Save RB_solution for current time level
+        RB_temporal_solution_data[i] = RB_solution;
+
+        epsilon_N = compute_transient_residual_dual_norm(dt, euler_theta, i, online_N,
+                                                         np.reshape(RB_solution, [online_N,1]),
+                                                         np.reshape(old_RB_solution,
+                                                                    [online_N,1]),
+                                                         cached_Fq_term, cached_Fq_Aq_vector,
+                                                         cached_Aq_Aq_matrix,
+                                                         cached_Fq_Mq_vector,
+                                                         cached_Aq_Mq_matrix,
+                                                         cached_Mq_Mq_matrix)
+
+        error_bound_sum += dt * (epsilon_N**2)
+        error_bound_all_k[i] = np.sqrt(error_bound_sum/alpha_LB)
+        #Mark 11
+        # for j in range(n_outputs):
+        #     RB_outputs_all_k[j][i] = np.sum(RB_Oq[:,j,:]*theta_O(online_mu_parameters)[j]*
+        #                                   np.reshape(RB_solution, [online_N,1]))
+        #     RB_output_error_bounds_all_k[j][i] = error_bound_all_k[i]* eval_output_dual_norm(j, q_l, online_mu_parameters, output_inner)
+        RB_outputs_all_k[i] = np.dot(RB_Oq_reshaped*theta_O_vec, RB_solution_reshaped).T
+        RB_output_error_bounds_all_k[i] = error_bound_all_k[i] * eval_output_dual_norm_new(delta_vec, theta_O_vec, output_inner)
+
+
+    return (RB_outputs_all_k, RB_output_error_bounds_all_k)
+
+
+# ## Online Stage
+
+# In[23]:
+
+
+path_offline_data = "offline_data"
+q_a = 3
+q_f = 1
+q_l = 1
+n_outputs = 80
+n_timesteps = 45
+dt = 1
+euler_theta = 1
+parameter_dependent_IC = False
+q_ic = 0
+q_m = 1
+online_mu_parameters = [1.05, 2.38, 1.05]
+num_runs = 1000
+
+# ## Read the Data
+
+# In[24]:
+
+
+t = time()
+[online_N,RB_Aq,RB_Fq, RB_Oq] = read_offline_data(path_offline_data, q_a, q_f, q_l, n_outputs)
+print("read_offline_data cost {}s\n".format(time()- t))
+
+
+# In[25]:
+
+
+t = time()
+[Fq_inner, Fq_Aq_inner, Aq_Aq_inner, output_inner] = read_error_offline_data(path_offline_data,
+                                                                             q_a, q_f, q_l, 
+                                                                             n_outputs, online_N)
+print(time()- t)
+
+
+# In[26]:
+
+
+t = time()
+[RB_Mq, initial_conditions] = read_transient_offline_data(path_offline_data, q_m, online_N,parameter_dependent_IC, 
+                                                          q_ic)
+time()- t
+
+
+# In[27]:
+
+
+t = time()
+[initial_L2_error, Fq_Mq_inner, Aq_Mq_inner, Mq_Mq_inner] = read_transient_error_offline_data(path_offline_data,
+                                                                                              online_N,q_a,q_m,q_f)
+time()- t
+
+
+# In[28]:
+
+
+t0 = time()
+for i in range(num_runs):
+    RB_outputs = transient_rb_solve_without_error_bound(online_mu_parameters, q_a, q_m, q_f, q_l, n_outputs, online_N, 
+                                                        n_timesteps, dt, euler_theta, RB_Aq, RB_Mq, RB_Fq, RB_Oq, 
+                                                        initial_conditions, parameter_dependent_IC = False, q_ic = 0,
+                                                        RB_L2_matrix = 0)
+
+
+print "transient_rb_solve_without_error_bound time =",(time()- t0)/num_runs
+
+#Mark 12
+delta_list = [1 if q_l1==q_l2 else 2 for q_l1 in range(10) for q_l2 in range(q_l1, q_l)]
+delta_vec = np.array(delta_list, dtype=float).reshape(-1,1)
+theta_O_vec = np.array(theta_O(online_mu_parameters)).T
+# In[29]:
+
+
+RB_outputs
+
+
+# In[30]:
+
+
+t1 = time()
+for i in range(num_runs):
+    [RB_outputs, RB_errors] = transient_rb_solve_with_error_bound(online_mu_parameters, q_a, q_m, q_f, q_l, n_outputs, 
+                                                                  online_N, n_timesteps, dt, euler_theta, RB_Aq, RB_Mq,
+                                                                  RB_Fq, RB_Oq, Fq_inner, Fq_Aq_inner, Aq_Aq_inner, 
+                                                                  output_inner, Fq_Mq_inner, Aq_Mq_inner, Mq_Mq_inner,
+                                                                  initial_conditions, initial_L2_error,
+                                                                  parameter_dependent_IC = False, 
+                                                                  q_ic = 0, RB_L2_matrix = 0)
+print "transient_rb_solve_with_error_bound =",(time()- t1)/num_runs
+
+# In[31]:
+
+
+#print("RB_errors is {}\n".format(RB_errors))
+
